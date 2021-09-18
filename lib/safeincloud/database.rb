@@ -23,69 +23,83 @@ module SafeInCloud
 
     attr_accessor :filename, :password
 
-    def initialize(filename, password)
+    def initialize(filename)
       @filename = filename
-      @password = password
+      @password = String.new
+      @file = File.open(@filename, 'r+')
+      @reader = Reader.new(@file)
     end
 
     ##
-    # Loads and decrypts database from file
-    def load
-      file = File.open(@filename, 'r')
-      reader = Reader.new(file)
+    # Loads database header
+    def read_header
+      @magic = @reader.read_short
+      raise DatabaseError, 'Database format is incorrect' if @magic != MAGIC
 
-      magic = reader.read_short
-      raise DatabaseError, 'Database format is incorrect' if magic != MAGIC
+      @version = @reader.read_byte
+      raise DatabaseError, 'Database version mismatch' if @version != VERSION
 
-      version = reader.read_byte
-      raise DatabaseError, 'Database version mismatch' if version != VERSION
+      @userkey_salt = @reader.read_array
+      @userkey_iv = @reader.read_array
+      @data_salt = @reader.read_array
+      @checksum = @reader.read_array
+    end
 
-      userkey_salt = reader.read_array
-      userkey_iv = reader.read_array
-      userkey_key = SecretKey.new(
+    ##
+    # Decrypts database checksum
+    def decrypt_checksum
+      @userkey_key = SecretKey.new(
         @password,
-        userkey_salt,
+        @userkey_salt,
         SecretKey::USERKEY_ITER
       )
-
-      data_salt = reader.read_array
-      checksum = reader.read_array
-      cipher = Cipher.new(userkey_key.key, userkey_iv)
+      cipher = Cipher.new(@userkey_key.key, @userkey_iv)
       begin
-        checksum = cipher.decrypt(checksum)
+        checksum = cipher.decrypt(@checksum)
       rescue OpenSSL::Cipher::CipherError => e
         raise DatabaseError, e
       end
       checksum_reader = Reader.new(StringIO.new(checksum))
-      data_iv = checksum_reader.read_array
-      data_password = checksum_reader.read_array
-      data_key = checksum_reader.read_array
+      @data_iv = checksum_reader.read_array
+      @data_password = checksum_reader.read_array
+      @data_key = checksum_reader.read_array
 
-      checksum_key = SecretKey.new(
-        data_password,
-        data_salt,
+      @checksum_key = SecretKey.new(
+        @data_password,
+        @data_salt,
         SecretKey::CHECKSUM_ITER
       )
 
-      raise DatabaseError, 'Wrong password' if data_key != checksum_key.key
+      raise DatabaseError, 'Wrong password' if @data_key != @checksum_key.key
+    end
 
-      cipher = Cipher.new(data_password, data_iv)
+    ##
+    # Decrypts and decompresses database data
+    def decrypt_data
+      cipher = Cipher.new(@data_password, @data_iv)
       begin
-        data = cipher.decrypt(reader.read)
+        data = cipher.decrypt(@reader.read)
       rescue OpenSSL::Cipher::CipherError => e
         raise DatabaseError, e
-      ensure
-        file.close
       end
 
       Zlib::Inflate.inflate(data)
     end
 
     ##
+    # Loads and decrypts database from file
+    def load
+      read_header
+      decrypt_checksum
+      decrypt_data
+    end
+
+    ##
     # Encrypts and saves database to file
     def save(data)
-      file = File.open(@filename, 'w')
-      writer = Writer.new(file)
+      @file.truncate(0)
+      @file.rewind
+      writer = Writer.new(@file)
 
       writer.write_short(MAGIC)
       writer.write_byte(VERSION)
@@ -122,7 +136,7 @@ module SafeInCloud
       data = cipher.encrypt(data)
       writer.write(data)
 
-      file.close
+      @file.close
     end
   end
 
@@ -134,19 +148,27 @@ module SafeInCloud
     end
 
     def read_byte
+      raise ReaderError if @io.eof?
+
       @io.read(1).unpack1('C')
     end
 
     def read_short
+      raise ReaderError if @io.eof?
+
       @io.read(2).unpack1('S')
     end
 
     def read_array
       size = read_byte
+      raise ReaderError if @io.eof?
+
       @io.read(size)
     end
 
     def read
+      raise ReaderError if @io.eof?
+
       @io.read
     end
   end
@@ -177,6 +199,10 @@ module SafeInCloud
   end
 
   ##
-  # Database error exception
+  # Database error
   class DatabaseError < StandardError; end
+
+  ##
+  # Reader error
+  class ReaderError < StandardError; end
 end
